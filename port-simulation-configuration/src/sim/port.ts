@@ -3,10 +3,12 @@
 // O caminhão é conduzido pelo cursor (ver truck.ts)
 // ============================================================
 import {
+  BED_MAX,
   BITE,
   CRANE,
   HOLDS,
   HOPPER,
+  ROUTE_IN,
   SHIP_CARGO,
   clamp,
   holdSurfaceY,
@@ -14,7 +16,8 @@ import {
   tri,
   GRAB_TINE,
 } from './config'
-import { CAP, Truck, type Vec } from './truck'
+import { Truck, type Vec } from './truck'
+import { Stage1, type GameState } from './mission'
 
 export type { Vec }
 export { Truck }
@@ -49,14 +52,6 @@ export class Axis {
   }
 }
 
-function pointSeg(px: number, py: number, ax: number, ay: number, bx: number, by: number) {
-  const dx = bx - ax
-  const dy = by - ay
-  const l2 = dx * dx + dy * dy || 1
-  const u = clamp(((px - ax) * dx + (py - ay) * dy) / l2, 0, 1)
-  return Math.hypot(px - ax - dx * u, py - ay - dy * u)
-}
-
 function angWrap(a: number, b: number) {
   let d = (a - b) % (Math.PI * 2)
   if (d > Math.PI) d -= Math.PI * 2
@@ -76,6 +71,8 @@ export interface Particle {
   vz: number
   floor: number
   r: number
+  /** Vida restante em quadros (usada pela retirada de excesso). */
+  life?: number
 }
 
 // ============================================================
@@ -210,8 +207,10 @@ export interface PortStats {
 type ShipPhase = 'docked' | 'leaving' | 'arriving'
 
 export class PortSim {
-  truck = new Truck(-150, HOPPER.z, 0)
-  target: Vec = { x: -150 + 74, y: HOPPER.z }
+  /** Caminhão do jogador (5 eixos). */
+  truck = new Truck(ROUTE_IN[0][0], ROUTE_IN[0][1], Math.PI)
+  /** Etapa 1 — operação no porto (conduz todos os veículos). */
+  game!: Stage1
   crane = new CraneSim()
   particles: Particle[] = []
   holds: number[] = HOLDS.map((h) => h.init)
@@ -231,11 +230,11 @@ export class PortSim {
   dumpHeld = false
   dumpLock = false
   private wasFull = false
-  private wasUnder = false
   private dumpedThisRaise = 0
 
   constructor() {
-    this.log('Turno iniciado — conduza o caminhão com o cursor')
+    this.game = new Stage1(this)
+    this.log('Terminal liberado — Etapa 1: carregamento no porto')
   }
 
   get shipOffset() {
@@ -248,20 +247,33 @@ export class PortSim {
     return `MV ATLÂNTICO ${this.shipNo}`
   }
 
+  /** Todos os veículos do pátio (para desenho com ordenação por profundidade). */
+  get trucks(): Truck[] {
+    return [...this.game.npcTrucks, this.truck]
+  }
+  /** Câmera (controlada pela missão). */
+  get cam() {
+    return this.game.cam
+  }
+  get scaleInPos() {
+    return this.game.scaleInPos
+  }
+  get scaleInSlab() {
+    return this.game.scaleInSlab
+  }
+  get scaleOutPos() {
+    return this.game.scaleOutPos
+  }
+  get scaleOutSlab() {
+    return this.game.scaleOutSlab
+  }
+
   log(msg: string) {
     const t = Math.floor(this.time / 60)
     const mm = String(Math.floor(t / 60)).padStart(2, '0')
     const ss = String(t % 60).padStart(2, '0')
     this.events.unshift(`[${mm}:${ss}] ${msg}`)
     if (this.events.length > 7) this.events.pop()
-  }
-
-  /** Alvo do para-choque, em coordenadas do pátio (X, Z). */
-  setTarget(p: Vec) {
-    this.target = {
-      x: clamp(p.x, -560, 700),
-      y: clamp(p.y, 60, 390),
-    }
   }
 
   setDumpHeld(v: boolean) {
@@ -274,8 +286,10 @@ export class PortSim {
   update(dt: number) {
     this.time += dt
     this.truck.dumping = this.dumpHeld || this.dumpLock
-    this.truck.update(this.target, dt)
-    this.updateLoading(dt)
+    // a missão decide quem despeja e quem retira
+    this.gateOpen = false
+    this.underHopper = false
+    this.game.update(dt)
     this.updateDump(dt)
     this.updateCrane(dt)
     this.updateShip(dt)
@@ -283,46 +297,57 @@ export class PortSim {
   }
 
   // ---------------- funil → caçamba ----------------
-  private updateLoading(dt: number) {
-    const t = this.truck
-    const front = t.trailerPoint(4)
-    const rear = t.trailerPoint(118)
-    const dist = pointSeg(HOPPER.x, HOPPER.z, front.x, front.y, rear.x, rear.y)
-    this.underHopper = dist < 20 && t.speed < 1.6 && t.bed < 0.12
-    this.gateOpen = false
-
-    if (this.underHopper && !this.wasUnder) this.log('Caçamba posicionada sob o funil')
-    this.wasUnder = this.underHopper
-
-    if (this.underHopper && this.hopperFill > 0.01 && t.load < CAP) {
-      const flow = Math.min(0.085 * dt, this.hopperFill, CAP - t.load)
-      t.load += flow
-      this.hopperFill -= flow
-      this.gateOpen = true
-      const f = t.load / CAP
-      this.streamY = 22 + (4 + 16 * f)
-      for (let k = 0; k < 2; k++) {
-        this.particles.push({
-          x: HOPPER.x + tri() * 4,
-          y: HOPPER.spoutY,
-          z: HOPPER.z + tri() * 4,
-          vx: tri() * 0.15,
-          vy: -(0.8 + Math.random()),
-          vz: tri() * 0.15,
-          floor: this.streamY + Math.random() * 2,
-          r: 1.3 + Math.random() * 1.4,
-        })
-      }
+  /**
+   * Despeja produto do funil na caçamba (chamado pela Etapa 1).
+   * Devolve a quantidade transferida, em toneladas.
+   */
+  pour(truck: Truck, rate: number, dt: number): number {
+    if (this.hopperFill <= 0.01 || truck.load >= BED_MAX) return 0
+    const flow = Math.min(rate * dt, this.hopperFill, BED_MAX - truck.load)
+    truck.load = Math.min(BED_MAX, truck.load + flow)
+    this.hopperFill -= flow
+    this.gateOpen = true
+    this.underHopper = true
+    this.streamY = 22 + (4 + 16 * (truck.load / BED_MAX))
+    for (let k = 0; k < 2; k++) {
+      this.particles.push({
+        x: HOPPER.x + tri() * 4,
+        y: HOPPER.spoutY,
+        z: HOPPER.z + tri() * 4,
+        vx: tri() * 0.15,
+        vy: -(0.8 + Math.random()),
+        vz: tri() * 0.15,
+        floor: this.streamY + Math.random() * 2,
+        r: 1.3 + Math.random() * 1.4,
+      })
     }
-
-    if (t.load >= CAP - 1e-3) {
-      t.load = CAP
-      if (!this.wasFull) {
-        this.wasFull = true
-        this.log(`Caçamba cheia (${CAP} t) — Espaço para bascular`)
-      }
-    } else if (t.load < CAP * 0.5) {
+    if (truck === this.truck && truck.load >= BED_MAX - 1e-3 && !this.wasFull) {
+      this.wasFull = true
+      this.log(`Caçamba na capacidade máxima (${BED_MAX} t)`)
+    } else if (truck.load < BED_MAX * 0.5) {
       this.wasFull = false
+    }
+    return flow
+  }
+
+  // ---------------- retirada de excesso ----------------
+  /** Partículas da sucção: caçamba → bocal da máquina. */
+  suck(truck: Truck, amount: number, dt: number): void {
+    const n = this.game.machinePose.nozzle
+    const q = clamp(Math.round((amount / Math.max(dt, 1e-3)) * 60), 1, 4)
+    for (let k = 0; k < q; k++) {
+      const a = truck.bedPoint(-30 - Math.random() * 78, (Math.random() - 0.5) * 22, 20 + Math.random() * 12)
+      this.particles.push({
+        x: a.x,
+        y: a.y,
+        z: a.z,
+        vx: (n.x - a.x) * 0.05 + tri() * 0.25,
+        vy: 1.5 + Math.random() * 0.8,
+        vz: (n.z - a.z) * 0.05 + tri() * 0.25,
+        floor: -99999,
+        r: 1.1 + Math.random() * 1.1,
+        life: 22 + Math.random() * 10,
+      })
     }
   }
 
@@ -491,23 +516,22 @@ export class PortSim {
       p.x += p.vx * dt
       p.y += p.vy * dt
       p.z += p.vz * dt
+      if (p.life !== undefined) p.life -= dt
     }
-    this.particles = this.particles.filter((p) => p.y > p.floor)
+    this.particles = this.particles.filter(
+      (p) => p.y > p.floor && (p.life === undefined || p.life > 0)
+    )
     if (this.particles.length > 400) this.particles.splice(0, this.particles.length - 400)
+  }
+
+  /** Estado da Etapa 1 para a interface do jogo. */
+  gameState(): GameState {
+    return this.game.gameState()
   }
 
   stats(): PortStats {
     const t = this.truck
-    const state =
-      t.bed > 0.08
-        ? 'BASCULANDO'
-        : this.gateOpen
-          ? 'CARREGANDO'
-          : this.underHopper
-            ? 'SOB O FUNIL'
-            : t.speed > 0.35
-              ? 'SEGUINDO O CURSOR'
-              : 'PARADO'
+    const state = this.game.msgFor()
     const phase =
       this.shipPhase === 'docked' ? 'Atracado' : this.shipPhase === 'leaving' ? 'Desatracando' : 'Atracando'
     return {

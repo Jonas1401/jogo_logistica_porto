@@ -1,0 +1,59 @@
+name: Publicar no GitHub Pages
+
+on:
+  push:
+    branches: [main, arena/1b53e041-jogo-logistica-porto]
+  workflow_dispatch:
+
+# Permissões mínimas para publicar no Pages
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Não deixa dois deploys disputarem o mesmo ambiente
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: port-simulation-configuration
+    steps:
+      - name: Baixar o código
+        uses: actions/checkout@v4
+
+      - name: Preparar o Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: port-simulation-configuration/package-lock.json
+
+      - name: Instalar dependências
+        run: npm ci
+
+      - name: Gerar o build (arquivo único)
+        run: npm run build
+
+      - name: Configurar o Pages
+        uses: actions/configure-pages@v5
+
+      - name: Enviar o build
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: port-simulation-configuration/dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Publicar
+        id: deployment
+        uses: actions/deploy-pages@v4

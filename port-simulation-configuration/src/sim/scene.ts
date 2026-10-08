@@ -13,7 +13,9 @@ import {
   HOLDS,
   HOLD_FLOOR,
   HOPPER,
+  LIMIT,
   SHIP,
+  SPOT,
   WATER_Y,
   angDiff,
   clamp,
@@ -23,6 +25,7 @@ import {
   smooth,
   type HoldDef,
 } from './config'
+import type { Weighing } from './mission'
 import {
   LINE,
   LINE_HI,
@@ -43,6 +46,11 @@ import {
 const SIDE = 'rgba(10,70,170,0.30)'
 const TOPF = 'rgba(20,110,230,0.22)'
 const BACKF = 'rgba(4,24,80,0.55)'
+/** Caminhão do jogador (destaque) e estado de excesso de peso. */
+const TINT_PLAYER = { main: '#6eccff', hi: '#cdf0ff' }
+const TINT_OVER = { main: '#ff5f7e', hi: '#ffc2cf' }
+/** Peso com vírgula decimal (padrão pt-BR). */
+const fmt1 = (v: number) => v.toFixed(1).replace('.', ',')
 
 const lerp3 = (a: V3, b: V3, t: number): V3 => [
   lerp(a[0], b[0], t),
@@ -73,9 +81,12 @@ class Layer {
     private draw: (ctx: CanvasRenderingContext2D) => void
   ) {}
 
+  /** Quantiza a escala para não redesenhar a cada quadro durante o zoom. */
   ensure(scale: number) {
-    if (Math.abs(scale - this.scale) < 0.002) return
-    this.scale = scale
+    const q = Math.max(0.05, Math.round(scale * 40) / 40)
+    if (Math.abs(q - this.scale) < 1e-6) return
+    this.scale = q
+    scale = q
     this.canvas.width = Math.max(1, Math.ceil(this.w * scale))
     this.canvas.height = Math.max(1, Math.ceil(this.h * scale))
     const c = this.canvas.getContext('2d')!
@@ -501,11 +512,15 @@ export class Renderer {
     for (let i = 0; i < this.specks.length; i++) this.specks[i] = Math.random() * 2 - 1
   }
 
-  render(sim: PortSim, ctx: CanvasRenderingContext2D, cw: number, ch: number) {
+  /** `inset` = altura (em px do canvas) ocupada pelo HUD, para não cobrir a ação. */
+  render(sim: PortSim, ctx: CanvasRenderingContext2D, cw: number, ch: number, inset = 0) {
     const F = FOCUS
-    const s = Math.min(cw / (F.x1 - F.x0), ch / (F.y1 - F.y0))
-    const tx = cw / 2 - (s * (F.x0 + F.x1)) / 2
-    const ty = ch / 2 - (s * (F.y0 + F.y1)) / 2
+    const base = Math.min(cw / (F.x1 - F.x0), ch / (F.y1 - F.y0))
+    const cam = sim.cam
+    const s = base * cam.zoom
+    const anchorY = (ch - inset) / 2
+    const tx = cw / 2 - s * cam.fx
+    const ty = anchorY - s * cam.fy
     this.s = s
     this.tx = tx
     this.ty = ty
@@ -518,6 +533,7 @@ export class Renderer {
 
     ctx.setTransform(s, 0, 0, s, tx, ty)
     this.drawBackground(ctx, sim, v)
+    this.drawYard(ctx, sim)
 
     // navio (+ pilhas de carga) com balanço e deslocamento de atracação
     const off = sim.shipOffset
@@ -531,20 +547,28 @@ export class Renderer {
     this.craneL.blit(ctx)
     this.hopBackL.blit(ctx)
 
-    const truckDepth = depthOf(sim.truck.x, 12, sim.truck.y)
+    // veículos + máquina de retirada, ordenados por profundidade
     const hopDepth = depthOf(HOPPER.x, 40, HOPPER.z + 42)
-    const drawRig = () => {
-      this.drawTruck(ctx, sim.truck)
-      this.drawPursuit(ctx, sim)
+    const jobs: { d: number; f: () => void }[] = []
+    for (const t of sim.trucks) {
+      const over = t === sim.truck && t.load > LIMIT
+      jobs.push({
+        d: depthOf(t.x, 12, t.y),
+        f: () => this.drawTruck(ctx, t, t === sim.truck ? (over ? TINT_OVER : TINT_PLAYER) : undefined),
+      })
     }
-    if (truckDepth < hopDepth) drawRig()
+    const mp = sim.game.machinePose
+    jobs.push({ d: depthOf(mp.x, 24, mp.z), f: () => this.drawMachine(ctx, sim) })
+    jobs.sort((a, b) => a.d - b.d)
 
+    for (const j of jobs) if (j.d < hopDepth) j.f()
     this.hopFrontL.blit(ctx)
     this.drawHopperContent(ctx, sim)
-    if (truckDepth >= hopDepth) drawRig()
+    for (const j of jobs) if (j.d >= hopDepth) j.f()
 
     this.drawCraneUpper(ctx, sim)
     this.drawParticles(ctx, sim)
+    this.drawMarks(ctx, sim)
   }
 
   // ---------------------------------------------------------
@@ -682,8 +706,289 @@ export class Renderer {
     ctx.setLineDash([6, 5])
     wz.stroke(ctx, LINE_HI, 1.1, 3, 0.6)
     ctx.setLineDash([])
-    this.groundText(ctx, 'ZONA DE CARGA — POSICIONE A CAÇAMBA', x - 150, z + 52)
-    this.groundText(ctx, 'PÁTIO · O CURSOR CONDUZ O CAMINHÃO', -80, 360)
+    this.groundText(ctx, 'ZONA DE CARGA — FUNIL / MOEGA', x - 150, z + 52)
+    this.groundText(ctx, 'PÁTIO · MOVIMENTAÇÃO AUTOMÁTICA', -80, 360)
+  }
+
+  // ---------------------------------------------------------
+  // Etapa 1: guias do pátio, balanças e área de retirada
+  // ---------------------------------------------------------
+  private drawYard(ctx: CanvasRenderingContext2D, sim: PortSim) {
+    const guide = (pts: [number, number][], color: string, alpha: number) => {
+      const w = new Wire()
+      w.poly(pts.map((p) => [p[0], 0.6, p[1]] as V3))
+      ctx.setLineDash([13, 15])
+      w.stroke(ctx, color, 1.1, 0, alpha)
+      ctx.setLineDash([])
+    }
+    guide(sim.game.routeIn.pts, LINE_HI, 0.22)
+    guide(sim.game.routeOut.pts, '#ffd28a', 0.16)
+
+    // área de retirada de excesso
+    const wz = new Wire()
+    wz.poly(
+      rectCorners(SPOT.excess.x - 26, SPOT.excess.y, 128, 38).map((p) => [p[0], 0.8, p[1]] as V3),
+      true
+    )
+    ctx.setLineDash([7, 6])
+    wz.stroke(ctx, '#ffb02e', 1.3, 3, 0.5)
+    ctx.setLineDash([])
+    this.groundText(
+      ctx,
+      'ÁREA DE RETIRADA DE EXCESSO',
+      SPOT.excess.x - 236,
+      SPOT.excess.y + 62,
+      'rgba(255,190,90,0.72)'
+    )
+    this.groundText(
+      ctx,
+      'FILA DE CARREGAMENTO',
+      sim.scaleInPos.x - 205,
+      sim.scaleInPos.y + 58,
+      'rgba(143,220,255,0.5)'
+    )
+    this.groundText(ctx, 'SAÍDA DO PORTO', -620, 196, 'rgba(143,220,255,0.42)')
+
+    this.drawScaleSlab(ctx, sim.scaleInSlab, 'BALANÇA DE ENTRADA', sim.game.weighIn.status === 'weighing', sim)
+    this.drawScaleSlab(ctx, sim.scaleOutSlab, 'BALANÇA DE SAÍDA', sim.game.weighOut.status === 'weighing', sim)
+  }
+
+  private drawScaleSlab(
+    ctx: CanvasRenderingContext2D,
+    p: { x: number; y: number },
+    label: string,
+    active: boolean,
+    sim: PortSim
+  ) {
+    const c = rectCorners(p.x, p.y, 134, 34, 0)
+    fillPoly(
+      ctx,
+      c.map((q) => [q[0], 0.4, q[1]] as V3),
+      'rgba(4,20,52,0.9)'
+    )
+    fillPoly(
+      ctx,
+      c.map((q) => [q[0], 3.6, q[1]] as V3),
+      active ? 'rgba(24,130,230,0.32)' : 'rgba(10,60,140,0.20)'
+    )
+    const w = new Wire()
+    w.poly(
+      c.map((q) => [q[0], 3.6, q[1]] as V3),
+      true
+    )
+    for (let i = -4; i <= 4; i++) {
+      const x = p.x + i * 30
+      w.seg([x, 3.6, p.y - 34], [x, 3.6, p.y + 34])
+    }
+    for (const sx of [-1, 1])
+      for (const sz of [-1, 1])
+        prism(ctx, w, rectCorners(p.x + sx * 112, p.y + sz * 26, 9, 9), 0, 4, SIDE, TOPF)
+    w.stroke(ctx, active ? '#7dffc3' : LINE, active ? 1.7 : 1.2, active ? 9 : 4, 0.95)
+
+    // varredura durante a pesagem
+    if (active) {
+      const u = (sim.time % 52) / 52
+      const x = p.x + 134 - 268 * u
+      const ws = new Wire()
+      ws.seg([x, 5, p.y - 34], [x, 5, p.y + 34])
+      ws.stroke(ctx, '#b6ffe0', 2.4, 12, 0.9)
+    }
+    this.groundText(
+      ctx,
+      label,
+      p.x - 122,
+      p.y + 54,
+      active ? 'rgba(125,255,195,0.9)' : 'rgba(143,220,255,0.5)'
+    )
+  }
+
+  // ---------------------------------------------------------
+  // placar da balança (poste + display) e marcações do caminhão
+  // ---------------------------------------------------------
+  private drawMarks(ctx: CanvasRenderingContext2D, sim: PortSim) {
+    const t = sim.truck
+    const g = sim.game
+    const over = t.load > LIMIT
+    const bc = t.bedCenter
+
+    // anel de destaque sob o caminhão do jogador
+    const show =
+      g.phase !== 'IDLE' && g.phase !== 'NEXT' && g.phase !== 'SUMMARY'
+    if (show) {
+      const color = over ? '#ff4d6d' : g.phase === 'LOADING' ? '#4cc3ff' : '#7dffc3'
+      const pulse = 1 + 0.05 * Math.sin(sim.time * 0.18)
+      this.groundRing(ctx, bc.x, bc.y, 94 * pulse, color, over ? 0.8 : 0.45)
+    }
+
+    const chipPhase: Record<string, boolean> = {
+      WEIGH_IN: true,
+      LOADING: true,
+      DECIDE: true,
+      OVERWEIGHT: true,
+      REMOVING: true,
+      CORRECTED: true,
+      WEIGH_OUT: true,
+    }
+    if (chipPhase[g.phase]) {
+      const val =
+        g.phase === 'WEIGH_IN' ? g.weighIn.value : g.phase === 'WEIGH_OUT' ? g.weighOut.value : t.load
+      const col = g.phase === 'WEIGH_IN' || g.phase === 'WEIGH_OUT' ? '#b6ffe0' : over ? '#ffb3c4' : '#dff4ff'
+      this.chip(ctx, bc.x, 104, bc.y, `${fmt1(val)} t`, col, 16)
+    }
+    if (g.phase === 'OVERWEIGHT') this.chip(ctx, bc.x, 138, bc.y, 'EXCESSO DE PESO', '#ff8fa3', 14)
+    if (g.phase === 'CORRECTED') this.chip(ctx, bc.x, 138, bc.y, 'PESO CORRIGIDO', '#7dffc3', 14)
+
+    this.drawPost(ctx, sim.scaleInSlab, 'BALANÇA DE ENTRADA', sim.game.weighIn, '#7dffc3')
+    this.drawPost(ctx, sim.scaleOutSlab, 'BALANÇA DE SAÍDA', sim.game.weighOut, '#8fdcff')
+  }
+
+  private drawPost(
+    ctx: CanvasRenderingContext2D,
+    slab: { x: number; y: number },
+    title: string,
+    w: Weighing,
+    color: string
+  ) {
+    const px = slab.x + 116
+    const pz = slab.y + 46
+    const wr = new Wire()
+    prism(ctx, wr, rectCorners(px, pz, 6, 6), 0, 6, SIDE, TOPF)
+    prism(ctx, wr, rectCorners(px, pz, 3.2, 3.2), 6, 78, SIDE, TOPF)
+    prism(ctx, wr, rectCorners(px, pz, 27, 4), 78, 110, 'rgba(4,20,52,0.92)', TOPF)
+    wr.stroke(ctx, LINE, 1.3, 5)
+    const txt = w.status === 'idle' ? '——,—' : `${fmt1(w.value)} t`
+    this.chip(ctx, px, 94, pz, txt, w.status === 'done' ? color : 'rgba(143,220,255,0.75)', 15)
+    this.chip(ctx, px, 122, pz, title, 'rgba(143,220,255,0.8)', 9.5)
+  }
+
+  /** Anel no chão (círculo em XZ). */
+  private groundRing(
+    ctx: CanvasRenderingContext2D,
+    x: number,
+    z: number,
+    r: number,
+    color: string,
+    alpha = 0.5
+  ) {
+    const pts: V3[] = []
+    for (let i = 0; i <= 28; i++) {
+      const a = (i / 28) * Math.PI * 2
+      pts.push([x + Math.cos(a) * r, 1.2, z + Math.sin(a) * r * 0.86])
+    }
+    const w = new Wire()
+    w.poly(pts)
+    w.stroke(ctx, color, 2, 8, alpha)
+  }
+
+  /** Etiqueta legível em espaço de tela, ancorada num ponto do mundo. */
+  private chip(
+    ctx: CanvasRenderingContext2D,
+    x: number,
+    y: number,
+    z: number,
+    text: string,
+    color: string,
+    size = 13
+  ) {
+    const q = proj(x, y, z)
+    ctx.save()
+    ctx.font = `bold ${size}px ui-monospace, SFMono-Regular, Menlo, monospace`
+    ctx.textAlign = 'center'
+    ctx.textBaseline = 'middle'
+    const w = ctx.measureText(text).width + size * 1.1
+    const h = size * 1.7
+    ctx.fillStyle = 'rgba(2,12,32,0.82)'
+    ctx.fillRect(q[0] - w / 2, q[1] - h / 2, w, h)
+    ctx.strokeStyle = color
+    ctx.lineWidth = Math.max(1, size * 0.12)
+    ctx.strokeRect(q[0] - w / 2, q[1] - h / 2, w, h)
+    ctx.fillStyle = color
+    ctx.fillText(text, q[0], q[1])
+    ctx.restore()
+  }
+
+  // ---------------------------------------------------------
+  // máquina de retirada de excesso
+  // ---------------------------------------------------------
+  private drawMachine(ctx: CanvasRenderingContext2D, sim: PortSim) {
+    const m = sim.game.machinePose
+    const cs = Math.cos(m.heading)
+    const sn = Math.sin(m.heading)
+    const C = (a: number, b = 0): [number, number] => [m.x + cs * a - sn * b, m.z + sn * a + cs * b]
+    const box = (a: number, hl: number, hw: number) => {
+      const p = C(a)
+      return rectCorners(p[0], p[1], hl, hw, m.heading)
+    }
+    const w = new Wire()
+
+    // chassi + rodas
+    prism(ctx, w, box(-2, 38, 19), 12, 30, SIDE, TOPF)
+    for (const a of [24, -26])
+      for (const sb of [-21, 21]) {
+        const c = C(a, sb)
+        ring(w, [c[0], 9, c[1]], [cs, 0, sn], [0, 1, 0], 9, 10)
+        ring(w, [c[0], 9, c[1]], [cs, 0, sn], [0, 1, 0], 3.6, 6)
+      }
+
+    // cabine, torre e coletor
+    prism(ctx, w, box(20, 14, 15), 30, 56, 'rgba(30,130,240,0.34)', TOPF)
+    prism(ctx, w, box(-27, 11, 9), 30, 62, SIDE, TOPF)
+    prism(ctx, w, box(-3, 11, 16), 30, 54, 'rgba(10,70,170,0.34)', 'rgba(20,110,230,0.18)')
+
+    // tambor giratório (só quando está operando)
+    if (m.boom > 0.05) {
+      const c = C(-3, 17)
+      const rot = sim.time * 0.22
+      ring(w, [c[0], 42, c[1]], [Math.cos(rot) * cs, 0, Math.cos(rot) * sn], [0, 1, 0], 12, 12)
+      for (let i = 0; i < 4; i++) {
+        const a = rot + (i * Math.PI) / 2
+        w.seg([c[0], 42, c[1]], [c[0] + Math.cos(a) * 12 * cs, 42 + Math.sin(a) * 12, c[1] + Math.cos(a) * 12 * sn])
+      }
+    }
+
+    // lança articulada: base → cotovelo → bocal
+    const truss = (a: V3, b: V3, half = 3.4) => {
+      const dx = b[0] - a[0]
+      const dz = b[2] - a[2]
+      const L = Math.hypot(dx, dz) || 1
+      const nx = (-dz / L) * half
+      const nz = (dx / L) * half
+      w.seg([a[0] + nx, a[1], a[2] + nz], [b[0] + nx, b[1], b[2] + nz])
+      w.seg([a[0] - nx, a[1], a[2] - nz], [b[0] - nx, b[1], b[2] - nz])
+      const n = Math.max(2, Math.round(L / 18))
+      for (let i = 0; i <= n; i++) {
+        const t = i / n
+        const cx = a[0] + dx * t
+        const cy = a[1] + (b[1] - a[1]) * t
+        const cz = a[2] + dz * t
+        w.seg([cx + nx, cy, cz + nz], [cx - nx, cy, cz - nz])
+      }
+    }
+    const A: V3 = [m.base.x, m.base.y, m.base.z]
+    const B: V3 = [m.elbow.x, m.elbow.y, m.elbow.z]
+    const N: V3 = [m.nozzle.x, m.nozzle.y, m.nozzle.z]
+    truss(A, B, 4.2)
+    truss(B, N, 3)
+
+    // bocal + mangote
+    prism(ctx, w, rectCorners(N[0], N[2], 9, 9), N[1] - 10, N[1] + 2, 'rgba(255,190,90,0.30)', TOPF)
+    const wb = new Wire()
+    ring(wb, [N[0], N[1] + 4, N[2]], [1, 0, 0], [0, 0, 1], 7, 10)
+    wb.stroke(ctx, '#ffd28a', 1.2, 6, 0.9)
+
+    w.stroke(ctx, m.boom > 0.5 ? '#ffcf6b' : LINE, 1.3, m.boom > 0.5 ? 7 : 4)
+
+    // farol de alerta
+    const bc = C(20, 0)
+    const q = proj(bc[0], 62, bc[1])
+    ctx.save()
+    ctx.fillStyle = m.boom > 0.5 ? '#ffbe4d' : 'rgba(120,180,255,0.7)'
+    ctx.shadowColor = ctx.fillStyle
+    ctx.shadowBlur = 9 * ctx.getTransform().a
+    ctx.beginPath()
+    ctx.arc(q[0], q[1], 2.8, 0, Math.PI * 2)
+    ctx.fill()
+    ctx.restore()
   }
 
   // ---------------------------------------------------------
@@ -851,7 +1156,7 @@ export class Renderer {
   // cavalo + carreta basculante articulada
   // cada módulo no próprio eixo: cavalo em θ1, carreta no pino-rei em θ2
   // ---------------------------------------------------------
-  private drawTruck(ctx: CanvasRenderingContext2D, t: Truck) {
+  private drawTruck(ctx: CanvasRenderingContext2D, t: Truck, tint?: { main: string; hi: string }) {
     const chd = Math.cos(t.heading)
     const shd = Math.sin(t.heading)
     const hh = t.hitch
@@ -924,7 +1229,7 @@ export class Renderer {
       }
       // barra de direção
       w.seg(V(QP(L1, -16), 9), V(QP(L1, 16), 9))
-      w.stroke(ctx, '#58c4ff', 1.4, 6)
+      w.stroke(ctx, tint ? tint.main : '#58c4ff', 1.4, 6)
 
       ctx.save()
       ctx.fillStyle = '#e4f7ff'
@@ -999,7 +1304,7 @@ export class Renderer {
           'rgba(40,140,230,0.4)'
         )
       }
-      w.stroke(ctx, LINE, 1.25, 5)
+      w.stroke(ctx, tint ? tint.main : LINE, 1.25, 5)
     }
 
     const dT = depthOf(...V(QP(30, 0), 20))
@@ -1049,27 +1354,12 @@ export class Renderer {
       if (i === 0) link.m(p)
       else link.l(p)
     }
-    link.stroke(ctx, hot ? '#ff6d88' : LINE_HI, 1.15, hot ? 8 : 3, 0.9)
+    link.stroke(ctx, hot ? '#ff6d88' : tint ? tint.hi : LINE_HI, 1.15, hot ? 8 : 3, 0.9)
 
     const hp = proj(hh.x, 30, hh.y)
     ctx.fillStyle = hot ? '#ff8aa0' : 'rgba(143,220,255,0.9)'
     ctx.font = 'bold 9px monospace'
     ctx.fillText(`φ ${Math.round((t.phi * 180) / Math.PI)}°`, hp[0] + 6, hp[1])
-  }
-
-  /** Linha do para-choque até o cursor — o cavalo persegue esse ponto. */
-  private drawPursuit(ctx: CanvasRenderingContext2D, sim: PortSim) {
-    const head = sim.truck.head
-    const g = sim.target
-    const w = new Wire()
-    w.seg([head.x, 3, head.y], [g.x, 3, g.y])
-    ctx.setLineDash([5, 6])
-    w.stroke(ctx, '#7dffc3', 1, 0, 0.55)
-    ctx.setLineDash([])
-    const mark = new Wire()
-    ring(mark, [g.x, 2, g.y], [1, 0, 0], [0, 0, 1], 7 + Math.sin(sim.time * 0.15) * 1.5, 12)
-    ring(mark, [g.x, 2, g.y], [1, 0, 0], [0, 0, 1], 2.4, 8)
-    mark.stroke(ctx, '#7dffc3', 1.2, 7, 0.95)
   }
 
   // ---------------------------------------------------------

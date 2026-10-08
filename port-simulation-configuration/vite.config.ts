@@ -11,6 +11,21 @@ const __dirname = path.dirname(__filename);
 // https://vite.dev/config/
 export default defineConfig({
   plugins: [react(), tailwindcss(), viteSingleFile()],
+  // Servidor acessível pelo preview do sandbox e pelo celular
+  server: {
+    host: true,
+    port: 5173,
+    strictPort: true,
+    allowedHosts: true,
+    cors: true,
+    hmr: { protocol: "wss", clientPort: 443 },
+  },
+  preview: {
+    host: true,
+    port: 4173,
+    allowedHosts: true,
+    cors: true,
+  },
   resolve: {
     alias: {
       "@": path.resolve(__dirname, "src"),

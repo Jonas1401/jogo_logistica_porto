@@ -95,7 +95,70 @@ export const HOPPER = {
 }
 
 // ---------------- Caminhão ----------------
-export const TRK = { L1: 52, C1: 6, L2: 100, CENTER: 58, CAP: 32 }
+export const TRK = { L1: 52, C1: 6, L2: 100, CENTER: 58, CAP: 46 }
+
+// ============================================================
+// ETAPA 1 — OPERAÇÃO NO PORTO (carregamento do caminhão)
+// As coordenadas (x, y) abaixo seguem o mesmo padrão do caminhão:
+// x = eixo X do mundo · y = eixo Z do mundo (pátio)
+// ============================================================
+
+/** Tara (peso vazio) do cavalo + carreta basculante 5 eixos (t). */
+export const TARA = 15
+/** Limite legal de carga por viagem (t). */
+export const LIMIT = 41.5
+/** Capacidade física da caçamba (t) — acima do limite, para o excesso existir. */
+export const BED_MAX = 46
+/** Vazão do funil (t por quadro). */
+export const LOAD_RATE = 0.056
+/** Vazão da máquina de retirada de excesso (t por quadro). */
+export const UNLOAD_RATE = 0.032
+/** Quadros que o sistema leva para cortar o fluxo após passar do limite. */
+export const OVER_GRACE = 42
+/** Espaçamento entre caminhões na fila (comprimento do veículo + folga). */
+export const QUEUE_GAP = 230
+
+/** Rota de entrada: portão → balança de entrada → fila → funil (sentido −X). */
+export const ROUTE_IN: [number, number][] = [
+  [1180, 330],
+  [940, 330],
+  [660, 330],
+  [492, 328],
+  [440, 322],
+  [390, 308],
+  [340, 288],
+  [292, 258],
+  [248, 222],
+  [210, 186],
+  [178, 158],
+  [150, 143],
+  [78, 140],
+]
+
+/** Rota de saída: funil → retirada de excesso → balança de saída → portão. */
+export const ROUTE_OUT: [number, number][] = [
+  [78, 140],
+  [-40, 140],
+  [-160, 140],
+  [-250, 140],
+  [-340, 140],
+  [-500, 140],
+  [-760, 140],
+]
+
+/** Pontos fixos do pátio. */
+export const SPOT = {
+  /** Portão de entrada (fora da tela). */
+  spawn: { x: 1180, y: 330 },
+  /** Área de retirada de excesso (posição do cavalo). */
+  excess: { x: -160, y: 140 },
+  /** Balança de saída (posição do cavalo). */
+  scaleOut: { x: -300, y: 140 },
+}
+
+/** Máquina de retirada de excesso: posição de repouso e de trabalho. */
+export const MACHINE_PARK = { x: -230, y: 300 }
+export const MACHINE_WORK = { x: 30, y: 140 }
 
 // ---------------- Foco da câmera (coordenadas projetadas) ----------------
 export const FOCUS = { x0: -440, y0: -500, x1: 500, y1: 230 }
