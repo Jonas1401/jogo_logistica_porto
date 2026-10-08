@@ -19,7 +19,8 @@ export const DELTA_MAX = 0.85 // esterço máximo (~49°)
 const PHI_SOFT = 62 * DEG // a partir daqui o esterço é contido
 const PHI_MAX = 88 * DEG // aqui o esterço vai a zero: anti-jackknife
 
-export const CAP = 32
+/** Capacidade física da caçamba (t). O limite legal da Etapa 1 é LIMIT (41,5 t). */
+export const CAP = 46
 
 // caçamba: articulação no fundo da traseira
 export const BED = { hingeA: -124, hingeY: 16, max: 50 * DEG, gate: 75 * DEG }
@@ -37,10 +38,27 @@ export class Truck {
   dumping = false
   id = 1
 
+  /** Quando true, o caminhão para ao chegar no alvo (fila, balança, funil). */
+  holdHere = false
+  /** Multiplicador de velocidade (usado nos deslocamentos longos da Etapa 1). */
+  speedScale = 1
+  /** Etiqueta curta desenhada sobre o veículo. */
+  tag = ''
+
   constructor(x: number, y: number, heading = 0) {
     this.x = x
     this.y = y
     this.heading = heading
+  }
+
+  /** Reposiciona o veículo (entrada no porto, retorno à fila). */
+  place(x: number, y: number, heading: number) {
+    this.x = x
+    this.y = y
+    this.heading = heading
+    this.phi = 0
+    this.steer = 0
+    this.speed = 0
   }
 
   // quinta-roda: o ponto físico onde cavalo e carreta se encontram
@@ -130,7 +148,8 @@ export class Truck {
     const far = clamp((dist - 120) / 360, 0, 1)
     let targetV = (1.3 + far * 3.8) * arrive
     targetV *= 1 - 0.4 * Math.abs(this.steer) / DELTA_MAX
-    if (dist > 42) targetV = Math.max(targetV, 1.4) // sem ré
+    if (dist > 42 && !this.holdHere) targetV = Math.max(targetV, 1.4) // sem ré
+    targetV *= this.speedScale
     this.speed += (targetV - this.speed) * (1 - Math.exp(-0.06 * dt))
 
     // 3) integra — cavalo (modelo de bicicleta) + carreta (engate)

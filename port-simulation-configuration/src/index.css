@@ -1,1 +1,33 @@
 @import "tailwindcss";
+
+/* ---------- base do jogo (mobile) ---------- */
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+  background: #020812;
+  overscroll-behavior: none;
+}
+
+body {
+  -webkit-tap-highlight-color: transparent;
+  -webkit-text-size-adjust: 100%;
+  text-rendering: optimizeLegibility;
+}
+
+canvas {
+  display: block;
+  touch-action: manipulation;
+}
+
+button {
+  font-family: inherit;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+/* números alinhados (peso, tempo) */
+.tabular {
+  font-variant-numeric: tabular-nums;
+}
