@@ -1,8 +1,9 @@
 name: Publicar no GitHub Pages
 
+# Executa manualmente (Actions → Publicar no GitHub Pages → Run workflow).
+# Para usar este deploy, antes ligue o Pages em:
+# Settings → Pages → Build and deployment → Source: GitHub Actions
 on:
-  push:
-    branches: [main, arena/1b53e041-jogo-logistica-porto]
   workflow_dispatch:
 
 # Permissões mínimas para publicar no Pages
